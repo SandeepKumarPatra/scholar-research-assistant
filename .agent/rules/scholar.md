@@ -8,3 +8,8 @@
 - Use the google-genai SDK (NOT google-generativeai) for the Gemini API
 - Read the model name from GEMINI_MODEL in .env; add retry with exponential
   backoff for rate-limit (429) errors
+- Use the google-genai SDK (NOT google-generativeai) for the Gemini API
+- Read the model name from GEMINI_MODEL in .env
+- Throttle Gemini calls to max 12 requests/minute
+- Retry with exponential backoff on 429 errors
+- Cache every LLM response on disk (keyed by prompt hash)
