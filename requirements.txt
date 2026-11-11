@@ -1,0 +1,5 @@
+# Dependencies for scholar
+requests>=2.31.0
+tqdm>=4.66.0
+arxiv>=2.1.0
+pytest>=8.0.0
