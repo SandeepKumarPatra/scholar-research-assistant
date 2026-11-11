@@ -37,3 +37,7 @@ htmlcov/
 data/pdfs/*.pdf
 !data/pdfs/.gitkeep
 data/metadata.json
+
+# Local Vector DB & Caches
+qdrant_data/
+.cache/
