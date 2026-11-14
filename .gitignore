@@ -45,3 +45,8 @@ data/parents*.json
 # Local Vector DB & Caches
 qdrant_data/
 .cache/
+
+
+data/*.bak
+data/parents*.db
+data/parents*.db.*
