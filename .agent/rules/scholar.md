@@ -13,3 +13,6 @@
 - Throttle Gemini calls to max 12 requests/minute
 - Retry with exponential backoff on 429 errors
 - Cache every LLM response on disk (keyed by prompt hash)
+- Never modify the baseline code in retrieval/naive.py or the
+  "scholar_papers" collection; new work goes in new files/collections
+- Every new component must be toggleable via config.yaml (needed for ablations)
