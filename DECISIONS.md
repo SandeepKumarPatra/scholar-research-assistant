@@ -1,10 +1,10 @@
 # Architecture and Design Decisions (DECISIONS.md)
 
-This document records the design and architectural choices for the **scholar** naive RAG baseline.
+This document records the design and architectural choices for the **scholar** project, spanning Phase 1 (Naive Baseline) and Phase 2 (Structured Parsing & Parent-Child Chunking).
 
 ---
 
-## 1. Document Extraction & Preprocessing
+## 1. Document Extraction & Preprocessing (Phase 1 Baseline)
 
 - **Tool**: `pypdf` (`PdfReader`)
 - **Granularity**: Text extracted page-by-page.
@@ -12,7 +12,7 @@ This document records the design and architectural choices for the **scholar** n
 
 ---
 
-## 2. Chunking Strategy
+## 2. Chunking Strategy (Phase 1 Baseline)
 
 - **Chunk Size**: 800 tokens
 - **Chunk Overlap**: 100 tokens
@@ -29,7 +29,7 @@ This document records the design and architectural choices for the **scholar** n
 
 ---
 
-## 3. Embedding Model & Vector Storage
+## 3. Embedding Model & Vector Storage (Phase 1 Baseline)
 
 - **Embedding Model**: `BAAI/bge-m3` via `sentence-transformers`
   - Output dimension: 1024
@@ -41,7 +41,7 @@ This document records the design and architectural choices for the **scholar** n
 
 ---
 
-## 4. Retrieval
+## 4. Retrieval (Phase 1 Baseline)
 
 - **Approach**: Naive dense retrieval.
 - **Depth**: Top 5 chunks (`top_k=5`) ranked by cosine similarity against the query embedding.
@@ -58,7 +58,7 @@ This document records the design and architectural choices for the **scholar** n
 - **Grounding & Citation Policy**:
   - Strict system prompt instructing the model to answer *only* using information provided in the retrieved context.
   - If the context does not contain enough information to answer, state clearly: *"I cannot answer this question based on the provided papers."*
-  - Sources must be cited as `[title, page]` corresponding to the chunks provided in context.
+  - Sources cited as `[title, page]` or `[title, pages X-Y]` corresponding to retrieved contexts.
 
 ---
 
@@ -75,8 +75,95 @@ This document records the design and architectural choices for the **scholar** n
 
 ## 7. CLI Interface
 
-- Simple command-line invocation:
+- Command-line invocation supporting `--mode naive` and `--mode parent_child`:
   ```bash
-  python cli.py "How does retrieval augmented generation reduce hallucination?"
+  python cli.py "How does retrieval augmented generation reduce hallucination?" --mode parent_child
   ```
-- Outputs the generated answer along with an explicit list of source references `[title, page]`.
+- Outputs the generated answer along with an explicit list of source references.
+
+---
+
+## 8. Structured PDF Parsing with Docling (Phase 2)
+
+- **Tool**: `docling` (`DocumentConverter`)
+- **OCR Disabled**: Born-digital academic PDFs have embedded text streams. Disabling OCR (`pipeline_options.do_ocr = False`) dramatically accelerates parsing speed, reduces memory consumption, and avoids pulling heavy OCR model weights.
+- **Table Structure Extraction**: Enabled (`pipeline_options.do_table_structure = True`). Tables are parsed into structured markdown to retain cell relationships and column alignments.
+- **Section & Heading Identification**: Traverses Docling document items, identifying section headers, paragraphs, and page boundaries (`page_start`, `page_end`).
+- **Heading Fallback**: If Docling detects no headings for a paper (e.g. unconventional formatting), the parser automatically falls back to 1 parent per page and emits a warning log.
+- **Disk Caching**: Parsed outputs are serialized as JSON in `data/parsed/{paper_id}.json`. Subsequent indexing or chunking reads from disk cache, ensuring expensive Docling parsing executes only once per paper.
+- **Metadata Authority**: Paper `title` and `year` are pulled directly from `data/metadata.json` rather than inferred from PDF cover heuristics.
+- **Section Classification**: Each section is tagged with `section_type`:
+  - `"body"`: Core academic content.
+  - `"references"`: Bibliography and works cited sections.
+  - `"appendix"`: Supplementary materials and appendices.
+
+---
+
+## 9. Structure-Aware Parent-Child Chunking (Phase 2)
+
+- **Hierarchical Representation**:
+  - **Parent**: Represents the full semantic context of an entire section or table.
+  - **Child**: Granular ~300 token slices of the parent section, embedded for dense vector search.
+- **Parent Splitting Cap (`max_parent_tokens: 1500`)**:
+  - Sections larger than 1500 tokens are split into bounded parent chunks (`_part0`, `_part1`, etc.).
+  - Prevents oversized sections from dominating the LLM context window during retrieval.
+  - Child chunks are linked directly to their respective parent slice.
+- **Table Handling**:
+  - Tables are maintained as standalone parent and child units in markdown format, preventing tabular data from fragmenting across arbitrary token windows.
+- **Reference Section Filtering**:
+  - Reference sections are preserved in the parsed JSON but excluded from the child index by default (`include_references: false`). This prevents dense retrieval from surfacing raw bibliography entries instead of meaningful explanatory prose.
+
+---
+
+## 10. Vector & Parent Storage Architecture (Phase 2)
+
+- **Isolation from Baseline**:
+  - The naive baseline Qdrant collection (`scholar_papers`) and `retrieval/naive.py` remain untouched.
+  - New child vectors are indexed into a separate Qdrant collection: `scholar_papers_v2`.
+- **Pure SQLite Parent Store**:
+  - Parent records are stored exclusively in `data/parents.db` with primary key indexing on `parent_id`.
+  - Schema:
+    ```sql
+    CREATE TABLE parents (
+        parent_id TEXT PRIMARY KEY,
+        paper_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        year INTEGER NOT NULL,
+        section TEXT NOT NULL,
+        section_type TEXT NOT NULL,
+        page_start INTEGER NOT NULL,
+        page_end INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        is_table INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_parents_paper ON parents(paper_id);
+    ```
+  - Enables $O(1)$ indexed retrieval of complete parent sections without memory bloat.
+
+---
+
+## 11. Parent-Child Retrieval & Citation Ranges (Phase 2)
+
+- **Search Workflow**:
+  1. Dense query embedding using `BAAI/bge-m3`.
+  2. Candidate search in `scholar_papers_v2` over granular child chunks.
+  3. Extraction of `parent_id`s and aggregation of the maximum child similarity score per parent.
+  4. Lookup of deduplicated parent sections from `data/parents.db`.
+  5. Ranking parents by score descending and slicing to `top_k`.
+- **Page Range Citations**:
+  - Citations dynamically adapt to page coverage:
+    - Single page: `[{title}, Page {page_start}]`
+    - Multi-page section: `[{title}, Pages {page_start}-{page_end}]`
+
+---
+
+## 12. Configuration & Ablation Framework
+
+- Centralized configuration in `config.yaml`:
+  - `retrieval.mode`: `"parent_child"` or `"naive"`
+  - `retrieval.top_k`: Context budget
+  - `chunking.child_chunk_size`: 300
+  - `chunking.max_parent_tokens`: 1500
+  - `chunking.include_references`: false
+- Every component supports CLI flag overrides, enabling reproducible ablation benchmarks between naive fixed-size chunking and structure-aware parent-child chunking.

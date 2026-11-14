@@ -133,19 +133,29 @@ _global_rate_limiter = RateLimiter(MAX_REQUESTS_PER_MINUTE)
 _global_cache = DiskResponseCache()
 
 
+def format_citation(ctx: Dict[str, Any]) -> str:
+    """Format citation string supporting single page or page ranges."""
+    title = ctx.get("title", "Unknown Title")
+    p_start = ctx.get("page_start", ctx.get("page", 1))
+    p_end = ctx.get("page_end", p_start)
+    if p_start == p_end:
+        return f"[{title}, Page {p_start}]"
+    return f"[{title}, Pages {p_start}-{p_end}]"
+
+
 def build_prompt(question: str, contexts: List[Dict[str, Any]]) -> str:
     """Build grounded RAG prompt strictly enforcing source citations."""
     context_sections = []
     for idx, ctx in enumerate(contexts, 1):
-        title = ctx.get("title", "Unknown Title")
-        page = ctx.get("page", 1)
+        cite_str = format_citation(ctx)
         paper_id = ctx.get("paper_id", "")
         text = ctx.get("text", "").strip()
         context_sections.append(
-            f"--- SOURCE [{title}, Page {page}] (ID: {paper_id}) ---\n{text}"
+            f"--- SOURCE {cite_str} (ID: {paper_id}) ---\n{text}"
         )
 
     context_str = "\n\n".join(context_sections)
+    sample_cite = format_citation(contexts[0]) if contexts else "[Title, Page 1]"
 
     prompt = f"""You are a rigorous academic AI research assistant for the Scholar project.
 Your task is to answer the user's question using ONLY the provided retrieved context snippets below.
@@ -155,7 +165,7 @@ CRITICAL INSTRUCTIONS:
 2. If the context does not contain enough information to answer the question, state:
    "I cannot answer this question based on the provided papers."
 3. Citations: You MUST cite every key claim or fact using the exact format:
-   [Title, Page X] (e.g. [{contexts[0].get('title', 'Paper Title') if contexts else 'Title'}, Page {contexts[0].get('page', 1) if contexts else 1}])
+   [Title, Page X] or [Title, Pages X-Y] (e.g. {sample_cite})
    matching the sources provided in the context.
 
 Retrieved Context:
@@ -241,9 +251,7 @@ def answer_question(
     unique_sources = []
     seen = set()
     for ctx in contexts:
-        title = ctx.get("title", "Unknown Title")
-        page = ctx.get("page", 1)
-        cite_str = f"[{title}, Page {page}]"
+        cite_str = format_citation(ctx)
         if cite_str not in seen:
             seen.add(cite_str)
             unique_sources.append(cite_str)

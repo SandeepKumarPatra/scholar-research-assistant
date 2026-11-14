@@ -11,13 +11,17 @@ scholar/
 ├── ingestion/                  # Data collection & indexing pipelines
 │   ├── __init__.py
 │   ├── download_arxiv.py       # arXiv paper & metadata downloader
-│   └── build_index.py          # PDF text extraction, chunking & Qdrant indexing
+│   ├── build_index.py          # Phase 1: Naive PDF extraction & Qdrant indexing
+│   ├── parse_docling.py        # Phase 2: Docling structured PDF parser & disk caching
+│   ├── chunk_structured.py     # Phase 2: Structure-aware parent-child chunking & SQLite store
+│   └── build_index_v2.py       # Phase 2: Child embedding & Qdrant scholar_papers_v2 indexer
 ├── retrieval/                  # Dense vector search & retrieval
 │   ├── __init__.py
-│   └── naive.py                # Top-5 dense retrieval using BAAI/bge-m3
+│   ├── naive.py                # Phase 1: Naive dense retrieval (scholar_papers)
+│   └── parent_child.py         # Phase 2: Parent-child retrieval & deduplication (scholar_papers_v2)
 ├── generation/                 # RAG prompt construction and LLM generation
 │   ├── __init__.py
-│   └── answer.py               # Google GenAI grounded generation with citations
+│   └── answer.py               # Google GenAI grounded generation with citations & page ranges
 ├── eval/                       # Hallucination and retrieval quality evaluation
 │   └── __init__.py
 ├── app/                        # Application / UI entry points
@@ -25,16 +29,23 @@ scholar/
 ├── tests/                      # Unit and integration test suite
 │   ├── __init__.py
 │   ├── test_download_arxiv.py  # Tests for arXiv ingestion
-│   ├── test_build_index.py     # Tests for PDF extraction & chunking
-│   ├── test_retrieval.py       # Tests for dense vector retrieval
-│   ├── test_generation.py      # Tests for Gemini grounding, rate limits & cache
-│   └── test_cli.py             # Tests for CLI entry point
-├── data/                       # Ingested datasets
-│   ├── pdfs/                   # Downloaded PDF papers (.gitignore tracked)
+│   ├── test_build_index.py     # Tests for naive PDF extraction & chunking
+│   ├── test_parse_docling.py   # Tests for Docling parser & stats
+│   ├── test_chunk_structured.py# Tests for structured parent-child chunking & SQLite
+│   ├── test_build_index_v2.py  # Tests for V2 child vector indexing
+│   ├── test_retrieval.py       # Tests for naive dense retrieval
+│   ├── test_parent_child_retrieval.py # Tests for parent-child retrieval & ranking
+│   ├── test_generation.py      # Tests for Gemini grounding & cache
+│   └── test_cli.py             # Tests for CLI entry point (naive & parent_child)
+├── data/                       # Ingested datasets (.gitignore tracked)
+│   ├── pdfs/                   # Downloaded PDF papers
+│   ├── parsed/                 # Phase 2: Docling parsed JSON files
+│   ├── parents.db              # Phase 2: SQLite database of parent sections & tables
 │   └── metadata.json           # JSON catalog of downloaded papers
 ├── qdrant_data/                # Local file-mode Qdrant vector database
 ├── .cache/                     # Local disk cache for generated responses
 ├── .env.example                # Example environment variables
+├── config.yaml                 # Central project configuration & ablation toggles
 ├── DECISIONS.md                # Architecture and design decisions
 ├── requirements.txt            # Python dependencies
 ├── cli.py                      # CLI entry point for RAG question answering
@@ -62,7 +73,7 @@ pip install -r requirements.txt
 
 ### Environment Configuration
 
-Copy the example `.env.example` file to `.env` and insert your Gemini API Key:
+Copy `.env.example` to `.env` and set your Gemini API Key:
 
 ```powershell
 Copy-Item .env.example .env
@@ -88,36 +99,62 @@ python ingestion/download_arxiv.py --max-papers 20
 
 - Downloads PDFs to `data/pdfs/`.
 - Saves structured metadata (`id`, `title`, `authors`, `year`, `abstract`, `url`) to `data/metadata.json`.
-- Adheres to arXiv's 3-second rate limit between requests.
 
-### 2. Build the Vector Index
+---
 
-Extract text per page using `pypdf`, split into fixed 800-token chunks (100 token overlap), embed with `BAAI/bge-m3`, and index into a local Qdrant collection:
+### 2. Phase 2: Structured Parsing & Parent-Child Pipeline
+
+Phase 2 replaces naive sliding-window chunking with structure-aware parent-child chunking.
+
+#### Step 2a: Parse PDFs with Docling (Cached to Disk)
+Parse PDFs into structured JSON under `data/parsed/` (sections, headings, body text, tables in markdown, page numbers):
 
 ```powershell
-python ingestion/build_index.py
+# Parse papers (OCR disabled for speed, tables enabled)
+python ingestion/parse_docling.py --limit 5
+
+# Sanity-check stats across all parsed papers
+python ingestion/parse_docling.py --stats
 ```
 
-Optional flags:
-- `--recreate`: Recreate collection from scratch.
-- `--chunk-size 800`: Token chunk size (default: 800).
-- `--chunk-overlap 100`: Token overlap between chunks (default: 100).
-- `--qdrant-path ./qdrant_data`: Storage location for local Qdrant database.
-
-### 3. Retrieve Contexts (Standalone)
-
-Test dense retrieval independently:
+#### Step 2b: Build Index V2 (Parents in SQLite, Children in Qdrant)
+Splits sections larger than `max_parent_tokens` (1500) into bounded parents, embeds ~300 token children with `BAAI/bge-m3` into `scholar_papers_v2`, and saves parents to SQLite `data/parents.db`:
 
 ```powershell
+python ingestion/build_index_v2.py --limit 5
+```
+
+#### Step 2c: Test Parent-Child Retrieval Standalone
+```powershell
+python retrieval/parent_child.py "How does RAG mitigate hallucinations?" --top-k 5
+```
+
+---
+
+### 3. Phase 1: Naive Baseline (Legacy)
+
+The original naive baseline remains completely intact:
+
+```powershell
+# Build naive index (fixed 800-token chunks into "scholar_papers")
+python ingestion/build_index.py
+
+# Retrieve with naive dense search
 python retrieval/naive.py "How does RAG mitigate hallucinations?" --top-k 5
 ```
 
+---
+
 ### 4. Ask Questions via CLI
 
-Run the full RAG pipeline through the command line:
+Run the full grounded RAG pipeline through the command line in either mode:
 
 ```powershell
-python cli.py "What causes hallucinations in large language models according to recent studies?"
+# Phase 2: Parent-Child Structure-Aware RAG (Default)
+python cli.py "What causes hallucinations in large language models according to recent studies?" --mode parent_child
+
+# Phase 1: Naive Baseline RAG
+python cli.py "What causes hallucinations in large language models according to recent studies?" --mode naive
 ```
 
 Output format:
@@ -125,16 +162,42 @@ Output format:
 ============================================================
 ANSWER:
 ============================================================
-Large language models can hallucinate due to software-level factors
-as well as hardware-level soft errors [Understanding LLM Hallucinations Caused by Soft Errors, Page 1].
+Large language models hallucinate due to software-level factors
+as well as hardware soft errors [Understanding LLM Hallucinations Caused by Soft Errors, Pages 1-3].
 ...
 
 ============================================================
 SOURCES:
 ============================================================
-- [Understanding LLM Hallucinations Caused by Soft Errors, Page 1]
+- [Understanding LLM Hallucinations Caused by Soft Errors, Pages 1-3]
 - [Automated Literature Review Using NLP Techniques, Page 2]
 ============================================================
+```
+
+---
+
+## Configuration & Ablation Studies
+
+Central settings can be adjusted in [`config.yaml`](config.yaml) to run controlled ablation experiments:
+
+```yaml
+retrieval:
+  mode: "parent_child"               # Options: "naive" | "parent_child"
+  top_k: 5
+  collection_naive: "scholar_papers"
+  collection_v2: "scholar_papers_v2"
+
+chunking:
+  child_chunk_size: 300              # Target child chunk size in tokens
+  child_chunk_overlap: 30            # Child token overlap
+  max_parent_tokens: 1500            # Split parents larger than this
+  include_references: false          # Exclude bibliography from child search index
+  include_appendix: true             # Include appendix sections
+
+storage:
+  qdrant_path: "./qdrant_data"
+  parsed_dir: "data/parsed"
+  parents_db: "data/parents.db"
 ```
 
 ---
@@ -143,24 +206,19 @@ SOURCES:
 
 Refer to [`DECISIONS.md`](DECISIONS.md) for full rationale:
 
-- **Provenance & Citations**: Chunks are tied to specific physical pages (`[title, page]`), enabling verifiable inline academic citations.
-- **Strict Grounding**: The LLM is instructed to answer *strictly* from retrieved context and explicitly refuse to fabricate answers when context is insufficient.
-- **Rate Throttling & Resilience**: Throttled to 12 requests/minute with exponential backoff on HTTP 429 (`RESOURCE_EXHAUSTED`).
-- **Disk Caching**: Responses are cached on disk (`.cache/generation_cache.json`) keyed by a deterministic hash of the model, question, and retrieved contexts.
-- **Embedded Vector DB**: Uses local file-mode Qdrant (`./qdrant_data`), requiring no external Docker containers or remote services.
+- **Structure Understanding**: Uses Docling with OCR disabled and table structure enabled to extract authentic academic paper structure.
+- **Parent-Child Retrieval**: Searches granular ~300 token child chunks to maximize dense retrieval precision, but returns complete parent sections (up to 1500 tokens) to provide rich, coherent context to the LLM.
+- **Page Range Citations**: Tracks `page_start` and `page_end` for accurate academic citations (`[Title, Pages X-Y]`).
+- **Disk Caching**: Both parsed document structures (`data/parsed/*.json`) and LLM responses (`.cache/generation_cache.json`) are cached on disk.
+- **Pure SQLite Storage**: Parent records are stored in an indexed SQLite database (`data/parents.db`).
+- **Zero Regression**: Baseline collection `scholar_papers` and `retrieval/naive.py` remain untouched.
 
 ---
 
 ## Running Tests
 
-Run the complete test suite using `pytest`:
+Run the complete test suite (45 unit and integration tests) using `pytest`:
 
 ```powershell
 pytest -v tests/
-```
-
-Or using standard Python `unittest`:
-
-```powershell
-python -m unittest discover tests
 ```

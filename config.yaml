@@ -1,0 +1,24 @@
+# Scholar configuration file
+
+retrieval:
+  mode: "parent_child"               # Options: "naive" | "parent_child"
+  top_k: 5
+  collection_naive: "scholar_papers"
+  collection_v2: "scholar_papers_v2"
+
+chunking:
+  child_chunk_size: 300              # Target child chunk size in tokens
+  child_chunk_overlap: 30            # Child token overlap
+  max_parent_tokens: 1500            # Split parent sections larger than this
+  include_references: false          # Exclude References/Bibliography from child vector index
+  include_appendix: true             # Include Appendix sections in child index
+
+storage:
+  qdrant_path: "./qdrant_data"
+  parsed_dir: "data/parsed"
+  parents_db: "data/parents.db"
+  metadata_file: "data/metadata.json"
+  pdfs_dir: "data/pdfs"
+
+models:
+  embedding: "BAAI/bge-m3"

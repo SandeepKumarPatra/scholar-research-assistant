@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""CLI interface for Scholar Naive RAG.
+"""CLI interface for Scholar RAG.
 
 Usage:
     python cli.py "your question"
+    python cli.py "your question" --mode naive
+    python cli.py "your question" --mode parent_child
 """
 
 import argparse
@@ -10,10 +12,18 @@ import sys
 from pathlib import Path
 
 from generation.answer import answer_question
+from ingestion.chunk_structured import load_config
 from retrieval.naive import retrieve
+from retrieval.parent_child import retrieve_parent_child
 
 
 def main() -> None:
+    config = load_config()
+    cfg_retrieval = config.get("retrieval", {})
+    default_mode = cfg_retrieval.get("mode", "parent_child")
+    default_qdrant_path = config.get("storage", {}).get("qdrant_path", "./qdrant_data")
+    default_parents_db = config.get("storage", {}).get("parents_db", "data/parents.db")
+
     parser = argparse.ArgumentParser(
         description="Scholar CLI: Ask questions grounded in indexed arXiv research papers."
     )
@@ -23,22 +33,35 @@ def main() -> None:
         help="The question to ask about the indexed research papers.",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["naive", "parent_child"],
+        default=default_mode,
+        help=f"Retrieval mode: 'naive' or 'parent_child' (default: {default_mode}).",
+    )
+    parser.add_argument(
         "--top-k",
         type=int,
-        default=5,
+        default=cfg_retrieval.get("top_k", 5),
         help="Number of context chunks to retrieve (default: 5).",
     )
     parser.add_argument(
         "--qdrant-path",
         type=str,
-        default="./qdrant_data",
-        help="Path to local Qdrant database (default: ./qdrant_data).",
+        default=default_qdrant_path,
+        help=f"Path to local Qdrant database (default: {default_qdrant_path}).",
     )
     parser.add_argument(
         "--collection-name",
         type=str,
-        default="scholar_papers",
-        help="Qdrant collection name (default: scholar_papers).",
+        default=None,
+        help="Qdrant collection name (default: scholar_papers for naive, scholar_papers_v2 for parent_child).",
+    )
+    parser.add_argument(
+        "--parents-db",
+        type=Path,
+        default=Path(default_parents_db),
+        help=f"Path to SQLite database for parent records (default: {default_parents_db}).",
     )
     parser.add_argument(
         "--no-cache",
@@ -47,26 +70,52 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Step 1: Dense Retrieval
+    # Determine collection name
+    if args.collection_name:
+        collection_name = args.collection_name
+    elif args.mode == "parent_child":
+        collection_name = cfg_retrieval.get("collection_v2", "scholar_papers_v2")
+    else:
+        collection_name = cfg_retrieval.get("collection_naive", "scholar_papers")
+
+    # Step 1: Retrieval
     try:
-        contexts = retrieve(
-            query=args.question,
-            top_k=args.top_k,
-            qdrant_path=args.qdrant_path,
-            collection_name=args.collection_name,
-        )
+        if args.mode == "parent_child":
+            contexts = retrieve_parent_child(
+                query=args.question,
+                top_k=args.top_k,
+                qdrant_path=args.qdrant_path,
+                collection_name=collection_name,
+                parents_db=args.parents_db,
+            )
+        else:
+            contexts = retrieve(
+                query=args.question,
+                top_k=args.top_k,
+                qdrant_path=args.qdrant_path,
+                collection_name=collection_name,
+            )
     except Exception as e:
-        print(f"\n[Error during retrieval]: {e}", file=sys.stderr)
+        build_cmd = (
+            "python ingestion/build_index_v2.py"
+            if args.mode == "parent_child"
+            else "python ingestion/build_index.py"
+        )
+        print(f"\n[Error during retrieval ({args.mode})]: {e}", file=sys.stderr)
         print(
-            "Please ensure you have built the index first using:\n"
-            "    python ingestion/build_index.py\n",
+            f"Please ensure you have built the index first using:\n    {build_cmd}\n",
             file=sys.stderr,
         )
         sys.exit(1)
 
     if not contexts:
-        print(f"\nNo relevant contexts found for question: '{args.question}'")
-        print("Please check that the index is populated with `python ingestion/build_index.py`.")
+        build_cmd = (
+            "python ingestion/build_index_v2.py"
+            if args.mode == "parent_child"
+            else "python ingestion/build_index.py"
+        )
+        print(f"\nNo relevant contexts found for question: '{args.question}' (mode: {args.mode})")
+        print(f"Please check that the index is populated with `{build_cmd}`.")
         sys.exit(0)
 
     # Step 2: Generation with Grounding and Citations
