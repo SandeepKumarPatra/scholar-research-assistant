@@ -59,8 +59,46 @@ def test_classify_section_type():
     assert classify_section_type("8. References") == "references"
     assert classify_section_type("Bibliography") == "references"
     assert classify_section_type("Works Cited") == "references"
+    assert classify_section_type("Literature Cited") == "references"
+    # Exact match only: prefix match should NOT match references
+    assert classify_section_type("References to Prior Work") == "body"
+    assert classify_section_type("Works Cited in Section 4") == "body"
     assert classify_section_type("Appendix A") == "appendix"
     assert classify_section_type("Supplementary Material") == "appendix"
+    # Past references flag returns appendix
+    assert classify_section_type("A Overview of HalluLens", past_references=True) == "appendix"
+    assert classify_section_type("Discussion", past_references=True) == "appendix"
+
+
+def test_parse_docling_document_appendix_after_references():
+    items = [
+        DummyItem("1 Introduction", "section_header", page_no=1),
+        DummyItem("Intro text.", "paragraph", page_no=1),
+        DummyItem("References", "section_header", page_no=2),
+        DummyItem("[1] Some Citation.", "paragraph", page_no=2),
+        DummyItem("A Overview of HalluLens", "section_header", page_no=3),
+        DummyItem("Appendix lettered text.", "paragraph", page_no=3),
+        DummyItem("B Additional Proofs", "section_header", page_no=4),
+        DummyItem("Proof details.", "paragraph", page_no=4),
+    ]
+    doc = DummyDoc(items=items, tables=[])
+    parsed = parse_docling_document(
+        doc=doc,
+        paper_id="paper_with_appendix",
+        title="Paper With Appendix",
+        year=2024,
+    )
+    sections = parsed["sections"]
+    assert len(sections) == 4
+    assert sections[0]["heading"] == "1 Introduction"
+    assert sections[0]["section_type"] == "body"
+    assert sections[1]["heading"] == "References"
+    assert sections[1]["section_type"] == "references"
+    # Sections after references must be appendix
+    assert sections[2]["heading"] == "A Overview of HalluLens"
+    assert sections[2]["section_type"] == "appendix"
+    assert sections[3]["heading"] == "B Additional Proofs"
+    assert sections[3]["section_type"] == "appendix"
 
 
 def test_sanitize_filename():

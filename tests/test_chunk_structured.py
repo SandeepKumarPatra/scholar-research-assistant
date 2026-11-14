@@ -10,6 +10,8 @@ from unittest.mock import patch
 from ingestion.chunk_structured import (
     chunk_all_parsed_papers,
     chunk_parent_into_children,
+    extract_table_label,
+    find_enclosing_section,
     get_parents_by_ids,
     init_parents_db,
     process_paper_chunks,
@@ -242,3 +244,92 @@ def test_chunk_all_parsed_papers_end_to_end(mock_tok, tmp_path: Path):
     assert len(parents) == 1
     assert len(children) == 1
     assert db_path.exists()
+
+
+def test_extract_table_label():
+    # Numbers
+    assert extract_table_label("Table 1: Detailed comparison", "Fallback") == "Table 1"
+    assert extract_table_label("Table 12 - Ablation", "Fallback") == "Table 12"
+    assert extract_table_label("Table 3. Metrics", "Fallback") == "Table 3"
+    # Roman numerals
+    assert extract_table_label("Table I: ROUGE scores", "Fallback") == "Table I"
+    assert extract_table_label("Table IV: Model settings", "Fallback") == "Table IV"
+    assert extract_table_label("Table XII.", "Fallback") == "Table XII"
+    # Strips trailing punctuation
+    assert extract_table_label("Table 2:   ", "Fallback") == "Table 2"
+    # Non-matches fall back
+    assert extract_table_label("Table on accuracy", "Fallback") == "Fallback"
+    assert extract_table_label("Overview", "Fallback") == "Fallback"
+    assert extract_table_label("", "Fallback") == "Fallback"
+
+
+def test_table_parent_inherits_section_type_and_keeps_caption():
+    parsed_paper = {
+        "paper_id": "p_table_test",
+        "title": "Table Test Paper",
+        "year": 2024,
+        "sections": [
+            {
+                "section_id": "sec_intro",
+                "heading": "Introduction",
+                "section_type": "body",
+                "page_start": 1,
+                "page_end": 2,
+                "text": "Intro text.",
+            },
+            {
+                "section_id": "sec_refs",
+                "heading": "References",
+                "section_type": "references",
+                "page_start": 3,
+                "page_end": 3,
+                "text": "[1] Citations.",
+            },
+            {
+                "section_id": "sec_app",
+                "heading": "A Additional Results",
+                "section_type": "appendix",
+                "page_start": 4,
+                "page_end": 5,
+                "text": "Appendix text.",
+            },
+        ],
+        "tables": [
+            {
+                "table_id": "p_table_test_tbl_0",
+                "page": 1,
+                "page_start": 1,
+                "page_end": 1,
+                "caption": "Table 1: Baseline Results across benchmarks.",
+                "markdown": "| Col1 | Col2 |\n|---|---|\n| 1 | 2 |",
+            },
+            {
+                "table_id": "p_table_test_tbl_1",
+                "page": 4,
+                "page_start": 4,
+                "page_end": 4,
+                "caption": "Table II: Appendix Detailed Ablations.",
+                "markdown": "| Metric | Val |\n|---|---|\n| Acc | 99 |",
+            },
+        ],
+    }
+
+    parents, children = process_paper_chunks(parsed_paper=parsed_paper)
+
+    # Find table parents
+    tbl_parents = [p for p in parents if p.get("is_table")]
+    assert len(tbl_parents) == 2
+
+    # Table 1 in Introduction -> section_type "body"
+    assert tbl_parents[0]["parent_id"] == "p_table_test_tbl_0"
+    assert tbl_parents[0]["section"] == "Table 1"  # short label only
+    assert tbl_parents[0]["section_type"] == "body"  # inherited from body section
+    assert tbl_parents[0]["text"].startswith("Table 1: Baseline Results across benchmarks.")
+    assert "| Col1 | Col2 |" in tbl_parents[0]["text"]
+
+    # Table II in Appendix -> section_type "appendix"
+    assert tbl_parents[1]["parent_id"] == "p_table_test_tbl_1"
+    assert tbl_parents[1]["section"] == "Table II"  # short label only
+    assert tbl_parents[1]["section_type"] == "appendix"  # inherited from appendix section
+    assert tbl_parents[1]["text"].startswith("Table II: Appendix Detailed Ablations.")
+    assert "| Metric | Val |" in tbl_parents[1]["text"]

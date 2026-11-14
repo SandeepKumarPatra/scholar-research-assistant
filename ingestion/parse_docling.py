@@ -47,12 +47,14 @@ def estimate_tokens(text: str) -> int:
     return len(simple_tokenize(text))
 
 
-def classify_section_type(heading: str) -> str:
+def classify_section_type(heading: str, past_references: bool = False) -> str:
     """Classify section type as 'references', 'appendix', or 'body'."""
     h = heading.strip().lower()
     h_clean = re.sub(r"^[\d\.\s\-]+", "", h).strip()
-    if re.search(r"^(references|bibliography|works cited|literature cited)", h_clean):
+    if re.search(r"^(references|bibliography|works cited|literature cited)$", h_clean):
         return "references"
+    if past_references:
+        return "appendix"
     if re.search(r"^(appendix|appendices|supplementary|supplemental)", h_clean):
         return "appendix"
     return "body"
@@ -153,6 +155,8 @@ def parse_docling_document(
 
     # 2. Iterate document items to group into sections
     current_heading: Optional[str] = None
+    current_section_type: str = "body"
+    seen_references: bool = False
     current_paragraphs: List[str] = []
     current_pages: List[int] = []
     page_paragraphs: Dict[int, List[str]] = {}  # Fallback for page-by-page grouping
@@ -200,13 +204,23 @@ def parse_docling_document(
                     {
                         "section_id": f"{paper_id}_sec_{len(sections)}",
                         "heading": current_heading,
-                        "section_type": classify_section_type(current_heading),
+                        "section_type": current_section_type,
                         "page_start": p_start,
                         "page_end": p_end,
                         "text": sec_text,
                         "token_count": estimate_tokens(sec_text),
                     }
                 )
+
+            # Classify new heading
+            ktype = classify_section_type(item_text, past_references=seen_references)
+            if ktype == "references":
+                seen_references = True
+                current_section_type = "references"
+            elif seen_references:
+                current_section_type = "appendix"
+            else:
+                current_section_type = ktype
 
             current_heading = item_text
             current_paragraphs = []
@@ -225,7 +239,7 @@ def parse_docling_document(
             {
                 "section_id": f"{paper_id}_sec_{len(sections)}",
                 "heading": current_heading,
-                "section_type": classify_section_type(current_heading),
+                "section_type": current_section_type,
                 "page_start": p_start,
                 "page_end": p_end,
                 "text": sec_text,

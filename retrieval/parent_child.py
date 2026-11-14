@@ -53,32 +53,58 @@ def get_embedding_model(model_name: str = DEFAULT_MODEL_NAME) -> Any:
 def retrieve_parent_child(
     query: str,
     top_k: int = DEFAULT_TOP_K,
-    candidate_multiplier: int = 3,
+    candidate_multiplier: int = 4,
+    max_candidate_multiplier: int = 10,
     qdrant_path: str = DEFAULT_QDRANT_PATH,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     parents_db: Path = DEFAULT_PARENTS_DB,
     model_name: str = DEFAULT_MODEL_NAME,
     client: Optional[Any] = None,
     model: Optional[Any] = None,
+    include_appendix: Optional[bool] = None,
+    include_references: Optional[bool] = None,
+    debug: bool = False,
 ) -> List[Dict[str, Any]]:
     """Retrieve top-K parent sections by searching child chunks.
+
+    Applies include_appendix and include_references filtering at query time.
+    Expands the candidate pool iteratively until top_k unique non-filtered
+    parents remain (capped at top_k * 10).
 
     Args:
         query: User question string.
         top_k: Number of deduplicated parent contexts to return (default: 5).
-        candidate_multiplier: Ratio of child candidates to fetch (default: 3x top_k).
+        candidate_multiplier: Initial child candidates multiplier (default: 4x top_k).
+        max_candidate_multiplier: Maximum candidate multiplier cap (default: 10x top_k).
         qdrant_path: Local Qdrant path.
         collection_name: Qdrant collection name (default: scholar_papers_v2).
         parents_db: Path to SQLite database containing parent records.
         model_name: SentenceTransformers model identifier.
         client: Optional pre-initialized QdrantClient.
         model: Optional pre-initialized SentenceTransformer model.
+        include_appendix: Whether to include appendix parents (defaults to config.yaml).
+        include_references: Whether to include references parents (defaults to config.yaml).
+        debug: If True, prints top 10 child hits before parent merging.
 
     Returns:
         List of dicts containing parent metadata, full text, score, and page range.
     """
     if not query or not query.strip():
         return []
+
+    # Load configuration toggles if not explicitly passed
+    config = load_config()
+    chunk_cfg = config.get("chunking", {})
+    retrieval_cfg = config.get("retrieval", {})
+
+    if include_appendix is None:
+        include_appendix = retrieval_cfg.get(
+            "include_appendix", chunk_cfg.get("include_appendix", False)
+        )
+    if include_references is None:
+        include_references = retrieval_cfg.get(
+            "include_references", chunk_cfg.get("include_references", False)
+        )
 
     if client is None:
         client = get_qdrant_client(qdrant_path=qdrant_path)
@@ -100,90 +126,152 @@ def retrieve_parent_child(
                 "Please run ingestion/build_index_v2.py first."
             )
             return []
-
-        candidate_limit = max(top_k * candidate_multiplier, 15)
-
-        if hasattr(client, "search"):
-            hits = client.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                limit=candidate_limit,
-                with_payload=True,
-            )
-        else:
-            response = client.query_points(
-                collection_name=collection_name,
-                query=query_vector,
-                limit=candidate_limit,
-                with_payload=True,
-            )
-            hits = response.points
-
     except Exception as e:
-        logger.error(f"Error querying Qdrant collection '{collection_name}': {e}")
+        logger.error(f"Error checking Qdrant collections: {e}")
         raise
 
-    if not hits:
-        logger.info(f"No child hits returned for query: '{query}'")
-        return []
+    # 3. Iteratively expand candidate pool until top_k non-filtered parents remain
+    max_candidates = top_k * max_candidate_multiplier
+    current_multiplier = candidate_multiplier
+    debug_printed = False
 
-    # 3. Collect parent IDs and track highest child score per parent
-    parent_best_score: Dict[str, float] = {}
-    parent_first_seen: Dict[str, int] = {}
+    valid_parents: List[Dict[str, Any]] = []
 
-    for idx, hit in enumerate(hits):
-        payload = hit.payload or {}
-        parent_id = payload.get("parent_id")
-        if not parent_id:
-            continue
+    while True:
+        candidate_limit = min(top_k * current_multiplier, max_candidates)
 
-        score = float(hit.score) if hasattr(hit, "score") and hit.score is not None else 0.0
+        try:
+            if hasattr(client, "search"):
+                hits = client.search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    limit=candidate_limit,
+                    with_payload=True,
+                )
+            else:
+                response = client.query_points(
+                    collection_name=collection_name,
+                    query=query_vector,
+                    limit=candidate_limit,
+                    with_payload=True,
+                )
+                hits = response.points
+        except Exception as e:
+            logger.error(f"Error querying Qdrant collection '{collection_name}': {e}")
+            raise
 
-        if parent_id not in parent_best_score:
-            parent_best_score[parent_id] = score
-            parent_first_seen[parent_id] = idx
-        else:
-            if score > parent_best_score[parent_id]:
+        if not hits:
+            logger.info(f"No child hits returned for query: '{query}'")
+            return []
+
+        # 4. Debug output: print top 10 child hits before parent merging
+        if debug and not debug_printed:
+            top_hits = hits[:10]
+            debug_pids = list(
+                dict.fromkeys(
+                    h.payload.get("parent_id")
+                    for h in top_hits
+                    if getattr(h, "payload", None) and h.payload.get("parent_id")
+                )
+            )
+            debug_parents_map = (
+                get_parents_by_ids(debug_pids, db_path=Path(parents_db))
+                if debug_pids
+                else {}
+            )
+
+            print(f"\n--- DEBUG: Top {len(top_hits)} Child Hits (Before Parent Merging) ---")
+            for rank, hit in enumerate(top_hits, 1):
+                payload = getattr(hit, "payload", {}) or {}
+                child_id = payload.get("child_id", str(getattr(hit, "id", "")))
+                parent_id = payload.get("parent_id", "")
+                p_info = debug_parents_map.get(parent_id, {})
+                sec_type = p_info.get("section_type", "unknown")
+                heading = p_info.get("section", "unknown")
+                raw_score = (
+                    hit.score
+                    if hasattr(hit, "score") and hit.score is not None
+                    else 0.0
+                )
+                text_snip = payload.get("text", "")[:100].replace("\n", " ")
+                print(f"[{rank}] Child ID: {child_id} | Parent ID: {parent_id}")
+                print(
+                    f"    Parent Heading: {heading} | Section Type: {sec_type} | Raw Score: {raw_score}"
+                )
+                print(f"    Text: {text_snip}...")
+            print("-" * 60 + "\n")
+            debug_printed = True
+
+        # 5. Collect parent IDs and track highest child score per parent
+        parent_best_score: Dict[str, float] = {}
+        for hit in hits:
+            payload = getattr(hit, "payload", {}) or {}
+            parent_id = payload.get("parent_id")
+            if not parent_id:
+                continue
+
+            score = (
+                float(hit.score)
+                if hasattr(hit, "score") and hit.score is not None
+                else 0.0
+            )
+            if parent_id not in parent_best_score or score > parent_best_score[parent_id]:
                 parent_best_score[parent_id] = score
 
-    # 4. Lookup parent records from SQLite
-    parents_map = get_parents_by_ids(
-        parent_ids=list(parent_best_score.keys()),
-        db_path=Path(parents_db),
-    )
-
-    # 5. Build and rank deduplicated parent contexts
-    ranked_parents: List[Dict[str, Any]] = []
-    for parent_id, best_score in parent_best_score.items():
-        p_record = parents_map.get(parent_id)
-        if not p_record:
-            logger.warning(f"Parent record '{parent_id}' not found in {parents_db}")
-            continue
-
-        p_start = p_record.get("page_start", 1)
-        p_end = p_record.get("page_end", p_start)
-
-        ranked_parents.append(
-            {
-                "parent_id": p_record["parent_id"],
-                "paper_id": p_record["paper_id"],
-                "title": p_record["title"],
-                "year": p_record["year"],
-                "section": p_record["section"],
-                "section_type": p_record.get("section_type", "body"),
-                "page_start": p_start,
-                "page_end": p_end,
-                "page": p_start,  # For compatibility with downstream naive format
-                "text": p_record["text"],
-                "token_count": p_record.get("token_count", 0),
-                "is_table": p_record.get("is_table", False),
-                "score": best_score,
-            }
+        # 6. Lookup parent records from SQLite
+        parents_map = get_parents_by_ids(
+            parent_ids=list(parent_best_score.keys()),
+            db_path=Path(parents_db),
         )
 
+        # 7. Filter parents based on query-time section_type criteria
+        current_valid: List[Dict[str, Any]] = []
+        for parent_id, best_score in parent_best_score.items():
+            p_record = parents_map.get(parent_id)
+            if not p_record:
+                continue
+
+            sec_type = p_record.get("section_type", "body")
+            if sec_type == "appendix" and not include_appendix:
+                continue
+            if sec_type == "references" and not include_references:
+                continue
+
+            p_start = p_record.get("page_start", 1)
+            p_end = p_record.get("page_end", p_start)
+            current_valid.append(
+                {
+                    "parent_id": p_record["parent_id"],
+                    "paper_id": p_record["paper_id"],
+                    "title": p_record["title"],
+                    "year": p_record["year"],
+                    "section": p_record["section"],
+                    "section_type": sec_type,
+                    "page_start": p_start,
+                    "page_end": p_end,
+                    "page": p_start,
+                    "text": p_record["text"],
+                    "token_count": p_record.get("token_count", 0),
+                    "is_table": p_record.get("is_table", False),
+                    "score": best_score,
+                }
+            )
+
+        valid_parents = current_valid
+
+        # Stop condition: enough unique parents, or reached cap, or exhausted hits
+        if (
+            len(valid_parents) >= top_k
+            or candidate_limit >= max_candidates
+            or len(hits) < candidate_limit
+        ):
+            break
+
+        current_multiplier += 2
+
     # Sort primarily by score descending
-    ranked_parents.sort(key=lambda x: x["score"], reverse=True)
-    results = ranked_parents[:top_k]
+    valid_parents.sort(key=lambda x: x["score"], reverse=True)
+    results = valid_parents[:top_k]
 
     # Log retrieval results with scores (per project rules)
     logger.info(f"Retrieved {len(results)} parent contexts for: '{query}'")
@@ -209,6 +297,23 @@ def main() -> None:
     parser.add_argument("--qdrant-path", type=str, default=DEFAULT_QDRANT_PATH)
     parser.add_argument("--collection-name", type=str, default=DEFAULT_COLLECTION_NAME)
     parser.add_argument("--parents-db", type=Path, default=DEFAULT_PARENTS_DB)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print top 10 child hits before parent merging.",
+    )
+    parser.add_argument(
+        "--include-appendix",
+        action="store_true",
+        default=None,
+        help="Force include appendix sections.",
+    )
+    parser.add_argument(
+        "--include-references",
+        action="store_true",
+        default=None,
+        help="Force include references sections.",
+    )
     args = parser.parse_args()
 
     results = retrieve_parent_child(
@@ -217,6 +322,9 @@ def main() -> None:
         qdrant_path=args.qdrant_path,
         collection_name=args.collection_name,
         parents_db=args.parents_db,
+        include_appendix=args.include_appendix,
+        include_references=args.include_references,
+        debug=args.debug,
     )
 
     print(f"\n--- Retrieved {len(results)} parent contexts for: '{args.query}' ---")

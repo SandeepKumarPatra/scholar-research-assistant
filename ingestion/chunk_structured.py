@@ -107,6 +107,32 @@ def get_tokenizer(model_name: str = "BAAI/bge-m3") -> Optional[Any]:
         return None
 
 
+def extract_table_label(caption: str, fallback_label: str) -> str:
+    """Extract 'Table N' short label requiring a number or roman numeral after 'Table'.
+    
+    Strips trailing punctuation (colons, periods, dashes, whitespace).
+    """
+    caption_clean = caption.strip()
+    m = re.match(r"^Table\s+([0-9]+|[IVXLCDM]+)\b", caption_clean, re.IGNORECASE)
+    if m:
+        return m.group(0).strip().rstrip(".:-–— \t")
+    return fallback_label
+
+
+def find_enclosing_section(
+    tbl: Dict[str, Any],
+    sections: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Find the section in which the table appears, based on page numbering."""
+    tbl_page = tbl.get("page_start", tbl.get("page", 1))
+    candidates = [s for s in sections if s.get("page_start", 1) <= tbl_page]
+    if candidates:
+        return candidates[-1]
+    if sections:
+        return sections[0]
+    return None
+
+
 # ============================================================================
 # SQLite Parents Store
 # ============================================================================
@@ -479,6 +505,7 @@ def process_paper_chunks(
             children.extend(sec_children)
 
     # 2. Process tables
+    sections = parsed_paper.get("sections", [])
     for tbl in parsed_paper.get("tables", []):
         md = tbl.get("markdown", "").strip()
         if not md:
@@ -487,19 +514,35 @@ def process_paper_chunks(
         tbl_id = tbl.get("table_id", f"{paper_id}_tbl_0")
         p_start = tbl.get("page_start", tbl.get("page", 1))
         p_end = tbl.get("page_end", p_start)
-        caption = tbl.get("caption") or f"Table (Page {p_start})"
+        raw_caption = (tbl.get("caption") or "").strip()
+
+        # Derive fallback if no numeric/roman Table label in caption
+        tbl_idx_match = re.search(r"_tbl_(\d+)$", tbl_id)
+        fallback = (
+            f"Table {int(tbl_idx_match.group(1)) + 1}"
+            if tbl_idx_match
+            else f"Table (Page {p_start})"
+        )
+        short_label = extract_table_label(raw_caption, fallback)
+
+        # Prepend caption to markdown table text
+        full_text = f"{raw_caption}\n\n{md}".strip() if raw_caption else md
+
+        # Inherit section_type from enclosing section
+        enclosing = find_enclosing_section(tbl, sections)
+        tbl_sec_type = enclosing.get("section_type", "body") if enclosing else "body"
 
         tbl_parent = {
             "parent_id": tbl_id,
             "paper_id": paper_id,
             "title": title,
             "year": year,
-            "section": caption,
-            "section_type": "table",
+            "section": short_label,
+            "section_type": tbl_sec_type,
             "page_start": p_start,
             "page_end": p_end,
-            "text": md,
-            "token_count": estimate_tokens(md),
+            "text": full_text,
+            "token_count": estimate_tokens(full_text),
             "is_table": True,
         }
         parents.append(tbl_parent)

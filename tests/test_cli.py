@@ -67,6 +67,30 @@ class TestCLI(unittest.TestCase):
             self.assertIn("SOURCES:", output)
             self.assertIn("[Understanding Hallucinations, Pages 1-2]", output)
 
+    @patch("sys.argv", ["cli.py", "What causes hallucination?", "--mode", "parent_child", "--debug"])
+    @patch("cli.retrieve_parent_child")
+    @patch("cli.answer_question")
+    def test_cli_parent_child_debug_flag(self, mock_answer, mock_ret_pc):
+        mock_ret_pc.return_value = [
+            {
+                "paper_id": "2411.18583v1",
+                "title": "Understanding Hallucinations",
+                "section": "1 Introduction",
+                "page_start": 1,
+                "page_end": 2,
+                "page": 1,
+                "text": "Parent section context.",
+                "score": 0.92,
+            }
+        ]
+        mock_answer.return_value = ("Answer", ["Source"])
+
+        with patch("sys.stdout", new_callable=io.StringIO):
+            main()
+            self.assertTrue(mock_ret_pc.called)
+            kwargs = mock_ret_pc.call_args.kwargs
+            self.assertTrue(kwargs.get("debug"))
+
     @patch("sys.argv", ["cli.py", "Unindexed question", "--mode", "naive"])
     @patch("cli.retrieve")
     def test_cli_no_contexts(self, mock_retrieve):

@@ -68,6 +68,11 @@ def main() -> None:
         action="store_true",
         help="Bypass response disk cache.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print top 10 child hits before parent merging for parent_child retrieval.",
+    )
     args = parser.parse_args()
 
     # Determine collection name
@@ -87,6 +92,7 @@ def main() -> None:
                 qdrant_path=args.qdrant_path,
                 collection_name=collection_name,
                 parents_db=args.parents_db,
+                debug=args.debug,
             )
         else:
             contexts = retrieve(

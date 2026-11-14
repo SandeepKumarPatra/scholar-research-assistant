@@ -14,7 +14,9 @@ scholar/
 │   ├── build_index.py          # Phase 1: Naive PDF extraction & Qdrant indexing
 │   ├── parse_docling.py        # Phase 2: Docling structured PDF parser & disk caching
 │   ├── chunk_structured.py     # Phase 2: Structure-aware parent-child chunking & SQLite store
-│   └── build_index_v2.py       # Phase 2: Child embedding & Qdrant scholar_papers_v2 indexer
+│   ├── build_index_v2.py       # Phase 2: Child embedding & Qdrant scholar_papers_v2 indexer
+│   ├── refresh_parents.py      # Standalone metadata refresh (post-References appendix & table inheritance)
+│   └── reembed_tables.py       # Optional script to re-embed table child chunks into scholar_papers_v2
 ├── retrieval/                  # Dense vector search & retrieval
 │   ├── __init__.py
 │   ├── naive.py                # Phase 1: Naive dense retrieval (scholar_papers)
@@ -33,10 +35,12 @@ scholar/
 │   ├── test_parse_docling.py   # Tests for Docling parser & stats
 │   ├── test_chunk_structured.py# Tests for structured parent-child chunking & SQLite
 │   ├── test_build_index_v2.py  # Tests for V2 child vector indexing
+│   ├── test_refresh_parents.py # Tests for metadata refresh and ID invariance
+│   ├── test_reembed_tables.py  # Tests for table vector and payload re-embedding
 │   ├── test_retrieval.py       # Tests for naive dense retrieval
-│   ├── test_parent_child_retrieval.py # Tests for parent-child retrieval & ranking
+│   ├── test_parent_child_retrieval.py # Tests for parent-child retrieval, candidate expansion & debug
 │   ├── test_generation.py      # Tests for Gemini grounding & cache
-│   └── test_cli.py             # Tests for CLI entry point (naive & parent_child)
+│   └── test_cli.py             # Tests for CLI entry point (naive, parent_child, and debug)
 ├── data/                       # Ingested datasets (.gitignore tracked)
 │   ├── pdfs/                   # Downloaded PDF papers
 │   ├── parsed/                 # Phase 2: Docling parsed JSON files
@@ -126,7 +130,29 @@ python ingestion/build_index_v2.py --limit 5
 
 #### Step 2c: Test Parent-Child Retrieval Standalone
 ```powershell
+# Basic retrieval
 python retrieval/parent_child.py "How does RAG mitigate hallucinations?" --top-k 5
+
+# Diagnostic debug mode (prints top 10 child hits before parent merging)
+python retrieval/parent_child.py "How does RAG mitigate hallucinations?" --top-k 5 --debug
+```
+
+#### Step 2d: Refresh Metadata (Post-References Appendices & Table Labels)
+Refreshes `data/parsed/*.json` and `data/parents.db` without modifying Qdrant or re-embedding:
+```powershell
+python ingestion/refresh_parents.py
+```
+- Creates a timestamped backup (`data/parents_<timestamp>.db.bak`).
+- Tags all sections after References heading as `appendix`.
+- Formats table parents as `"Table N"` short labels and preserves full captions in `text`.
+- Tables inherit `section_type` from the enclosing section (tables after References become `appendix`).
+- Verifies ID invariance (aborts and restores backup on mismatch).
+- Prints a before/after comparison table with token percentages and `>40%` warnings.
+
+#### Step 2e: Optional Table Re-embedding
+To update vector representations of table chunks with their full captions:
+```powershell
+python ingestion/reembed_tables.py --limit 5
 ```
 
 ---
@@ -152,6 +178,9 @@ Run the full grounded RAG pipeline through the command line in either mode:
 ```powershell
 # Phase 2: Parent-Child Structure-Aware RAG (Default)
 python cli.py "What causes hallucinations in large language models according to recent studies?" --mode parent_child
+
+# Phase 2 with Debug Diagnostics
+python cli.py "What causes hallucinations in large language models according to recent studies?" --mode parent_child --debug
 
 # Phase 1: Naive Baseline RAG
 python cli.py "What causes hallucinations in large language models according to recent studies?" --mode naive
@@ -217,7 +246,7 @@ Refer to [`DECISIONS.md`](DECISIONS.md) for full rationale:
 
 ## Running Tests
 
-Run the complete test suite (45 unit and integration tests) using `pytest`:
+Run the complete test suite (59 unit and integration tests) using `pytest`:
 
 ```powershell
 pytest -v tests/

@@ -11,8 +11,9 @@ chunking:
   child_chunk_overlap: 30            # Child token overlap
   max_parent_tokens: 1500            # Split parent sections larger than this
   include_references: false          # Exclude References/Bibliography from child vector index
-  include_appendix: true             # Include Appendix sections in child index
-
+  include_appendix: false            # Include Appendix sections in child index
+  
+  
 storage:
   qdrant_path: "./qdrant_data"
   parsed_dir: "data/parsed"

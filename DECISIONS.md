@@ -166,4 +166,49 @@ This document records the design and architectural choices for the **scholar** p
   - `chunking.child_chunk_size`: 300
   - `chunking.max_parent_tokens`: 1500
   - `chunking.include_references`: false
+  - `chunking.include_appendix`: false
 - Every component supports CLI flag overrides, enabling reproducible ablation benchmarks between naive fixed-size chunking and structure-aware parent-child chunking.
+
+---
+
+## 13. Appendix Detection & Table Section Type Inheritance
+
+- **Strict References Detection**:
+  - Detects reference headings using exact matching: `^(references|bibliography|works cited|literature cited)$` after stripping optional section numbering and punctuation.
+  - Avoids false-positive prefix matches on headings like "References to Prior Work".
+- **Post-References Appendix Heuristic**:
+  - All sections appearing after the References heading are classified as `section_type: "appendix"`, accurately capturing lettered appendices (e.g., `A Overview of HalluLens`, `B Implementation Details`).
+- **Table Section Type Inheritance**:
+  - Table parents dynamically inherit `section_type` from the enclosing section in which they appear based on document reading order and page coverage.
+  - Tables located after References become `section_type: "appendix"` (with `is_table: True`), ensuring that appendix filtering toggles correctly exclude both appendix prose and appendix tables.
+
+---
+
+## 14. Query-Time Section Filtering & Iterative Candidate Expansion
+
+- **Query-Time Filtering**:
+  - `include_appendix` and `include_references` are evaluated at query time in `retrieval/parent_child.py`, rather than at index time.
+  - Enables instant ablation toggling without re-embedding child vectors in Qdrant.
+- **Iterative Candidate Expansion (Cap at $top\_k \times 10$)**:
+  - Vector search initially fetches $top\_k \times 4$ candidate child chunks.
+  - If post-filtering by `section_type` leaves fewer than $top\_k$ unique parents, the candidate pool automatically expands in steps up to a ceiling of $top\_k \times 10$ (or until the collection runs out of hits).
+  - Guarantees $top\_k$ relevant parents are returned even when top dense matches belong to excluded sections.
+
+---
+
+## 15. Table Representation, Diagnostics, and Metadata Refresh
+
+- **Table Short Labeling & Caption Preservation**:
+  - Table section names are normalized to short labels `"Table N"` requiring a number or roman numeral (`^Table\s+([0-9]+|[IVXLCDM]+)\b`), with trailing punctuation stripped.
+  - The entire original caption is preserved in the table parent `text` (`f"{caption}\n\n{markdown}"`).
+- **Retrieval vs LLM Context Distinction**:
+  - Prepending captions to table text in `parents.db` immediately enhances the LLM prompt context upon retrieval.
+  - To update dense vector retrieval representations with captions, the optional script `ingestion/reembed_tables.py` re-embeds only table child chunks into `scholar_papers_v2` with updated vectors and Qdrant payloads.
+- **Diagnostic `--debug` Flag**:
+  - Available on `cli.py` and `retrieval/parent_child.py`.
+  - Prints the top 10 child hits before parent merging with full-precision raw scores, child IDs, parent IDs, parent headings, and section types resolved directly from `parents.db` (bypassing stale vector payloads).
+- **Standalone Metadata Refresh (`ingestion/refresh_parents.py`)**:
+  - Safely updates `data/parsed/*.json` and `data/parents.db` with zero Qdrant interactions.
+  - Creates a timestamped backup (`parents_<timestamp>.db.bak`) prior to execution.
+  - Enforces parent ID invariance: if the set of `parent_id`s differs after the refresh, the backup is automatically restored and execution aborts.
+  - Generates a before/after audit report showing appendix and reference parent counts per paper, with token percentage calculations and warnings for papers exceeding 40% non-body tokens.
