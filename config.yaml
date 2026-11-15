@@ -1,10 +1,18 @@
 # Scholar configuration file
 
 retrieval:
-  mode: "parent_child"               # Options: "naive" | "parent_child"
+  mode: "parent_child"               # Options: "naive" | "parent_child" | "hybrid" | "hybrid_rerank"
   top_k: 5
   collection_naive: "scholar_papers"
   collection_v2: "scholar_papers_v2"
+  collection_v3: "scholar_papers_v3"
+  use_bm25: true
+  use_reranker: true
+  rrf_k: 60
+  dense_candidates: 50
+  bm25_candidates: 50
+  rerank_top_n: 20
+  max_parents_per_paper: 2       # null = off; positive integer limits parents from same paper
 
 chunking:
   child_chunk_size: 300              # Target child chunk size in tokens
@@ -20,6 +28,10 @@ storage:
   parents_db: "data/parents.db"
   metadata_file: "data/metadata.json"
   pdfs_dir: "data/pdfs"
+  bm25_index: "data/bm25_index.pkl"
+  rerank_cache: ".cache/rerank_cache.json"
 
 models:
   embedding: "BAAI/bge-m3"
+  reranker: "BAAI/bge-reranker-v2-m3"
+

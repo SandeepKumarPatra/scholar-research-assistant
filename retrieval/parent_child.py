@@ -19,7 +19,9 @@ from ingestion.chunk_structured import (
 
 logger = logging.getLogger("scholar.retrieval.parent_child")
 
-DEFAULT_COLLECTION_NAME = "scholar_papers_v2"
+DEFAULT_COLLECTION_NAME_V2 = "scholar_papers_v2"
+DEFAULT_COLLECTION_NAME_V3 = "scholar_papers_v3"
+DEFAULT_COLLECTION_NAME = "scholar_papers_v3"
 DEFAULT_QDRANT_PATH = "./qdrant_data"
 DEFAULT_MODEL_NAME = "BAAI/bge-m3"
 DEFAULT_TOP_K = 5
@@ -56,7 +58,7 @@ def retrieve_parent_child(
     candidate_multiplier: int = 4,
     max_candidate_multiplier: int = 10,
     qdrant_path: str = DEFAULT_QDRANT_PATH,
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: Optional[str] = None,
     parents_db: Path = DEFAULT_PARENTS_DB,
     model_name: str = DEFAULT_MODEL_NAME,
     client: Optional[Any] = None,
@@ -96,6 +98,11 @@ def retrieve_parent_child(
     config = load_config()
     chunk_cfg = config.get("chunking", {})
     retrieval_cfg = config.get("retrieval", {})
+
+    if collection_name is None:
+        collection_name = retrieval_cfg.get(
+            "collection_v3", retrieval_cfg.get("collection_v2", DEFAULT_COLLECTION_NAME)
+        )
 
     if include_appendix is None:
         include_appendix = retrieval_cfg.get(
@@ -295,7 +302,12 @@ def main() -> None:
     parser.add_argument("query", type=str, help="Search query")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Top K results (default: 5)")
     parser.add_argument("--qdrant-path", type=str, default=DEFAULT_QDRANT_PATH)
-    parser.add_argument("--collection-name", type=str, default=DEFAULT_COLLECTION_NAME)
+    parser.add_argument(
+        "--collection-name",
+        type=str,
+        default=None,
+        help=f"Qdrant collection name (default: from config.yaml or {DEFAULT_COLLECTION_NAME}).",
+    )
     parser.add_argument("--parents-db", type=Path, default=DEFAULT_PARENTS_DB)
     parser.add_argument(
         "--debug",

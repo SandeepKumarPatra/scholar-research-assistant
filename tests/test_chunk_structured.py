@@ -333,3 +333,168 @@ def test_table_parent_inherits_section_type_and_keeps_caption():
     assert tbl_parents[1]["section_type"] == "appendix"  # inherited from appendix section
     assert tbl_parents[1]["text"].startswith("Table II: Appendix Detailed Ablations.")
     assert "| Metric | Val |" in tbl_parents[1]["text"]
+
+
+def test_children_no_mid_word_and_contiguous_spans():
+    """Verify child chunking never starts or ends mid-word and is always a contiguous span."""
+    parent = {
+        "parent_id": "paper_test_sec_0",
+        "paper_id": "paper_test",
+        "title": "Title of Test",
+        "year": 2024,
+        "section": "1 Introduction",
+        "section_type": "body",
+        "page_start": 1,
+        "page_end": 2,
+        "text": (
+            "Large language models often suffer from hallucinations in retrieval augmented generation. "
+            "Recent studies by Smith et al. suggest dense vector search mitigates factuality errors. "
+            "For example, soft errors in GPU memory can induce hallucinations as noted in Fig. 2. "
+            "Our experiments on benchmark datasets demonstrate a 15% reduction in hallucination rates. "
+            "Furthermore, structure-aware chunking preserves table context and heading hierarchies. "
+            "In conclusion, parent-child retrieval combines granular search precision with broad LLM context."
+        ),
+        "is_table": False,
+    }
+
+    # Set child_chunk_size small enough to trigger multi-chunk sentence packing
+    children = chunk_parent_into_children(
+        parent=parent,
+        child_chunk_size=30,
+        tokenizer=None,
+    )
+    assert len(children) >= 2
+
+    p_text = parent["text"]
+    for c in children:
+        c_text = c["text"]
+        # 1. Contiguous span
+        assert c_text in p_text, f"Child text not found in parent text: {c_text}"
+
+        idx = p_text.find(c_text)
+        assert idx != -1
+
+        # 2. No start mid-word
+        if idx > 0:
+            char_before = p_text[idx - 1]
+            assert not (char_before.isalnum() and c_text[0].isalnum()), (
+                f"Child starts mid-word! Preceding char: {char_before!r}, Child start: {c_text[:10]!r}"
+            )
+
+        # 3. No end mid-word
+        end_idx = idx + len(c_text)
+        if end_idx < len(p_text):
+            char_after = p_text[end_idx]
+            assert not (c_text[-1].isalnum() and char_after.isalnum()), (
+                f"Child ends mid-word! Child end: {c_text[-10:]!r}, Following char: {char_after!r}"
+            )
+
+
+def test_one_sentence_overlap_and_parent_ids_unchanged():
+    """Verify 1-sentence overlap between consecutive sentence-packed child chunks and parent ID invariance."""
+    parsed_paper = {
+        "paper_id": "paper_overlap",
+        "title": "Overlap Paper",
+        "year": 2024,
+        "sections": [
+            {
+                "section_id": "paper_overlap_sec_0",
+                "heading": "Introduction",
+                "section_type": "body",
+                "page_start": 1,
+                "page_end": 1,
+                "text": (
+                    "Sentence zero is introductory. "
+                    "Sentence one describes the problem. "
+                    "Sentence two introduces the methodology. "
+                    "Sentence three evaluates the results. "
+                    "Sentence four concludes the work."
+                ),
+            }
+        ],
+        "tables": [
+            {
+                "table_id": "paper_overlap_tbl_0",
+                "page": 2,
+                "page_start": 2,
+                "page_end": 2,
+                "caption": "Table 1: Benchmark Comparisons",
+                "markdown": "| System | Accuracy |\n|---|---|\n| Scholar | 98% |",
+            }
+        ],
+    }
+
+    parents, children = process_paper_chunks(
+        parsed_paper=parsed_paper,
+        child_chunk_size=16,  # Force ~2 sentences per chunk
+        tokenizer=None,
+    )
+
+    # 1. Verify parent IDs remain unchanged
+    parent_ids = [p["parent_id"] for p in parents]
+    assert parent_ids == ["paper_overlap_sec_0", "paper_overlap_tbl_0"]
+
+    # 2. Verify section children have one-sentence overlap
+    sec_children = [c for c in children if not c["is_table"]]
+    assert len(sec_children) >= 2
+
+    for k in range(len(sec_children) - 1):
+        curr_text = sec_children[k]["text"]
+        next_text = sec_children[k + 1]["text"]
+        curr_sentences = [s.strip() for s in curr_text.split(".") if s.strip()]
+        next_sentences = [s.strip() for s in next_text.split(".") if s.strip()]
+        last_s_curr = curr_sentences[-1]
+        first_s_next = next_sentences[0]
+        assert last_s_curr == first_s_next, (
+            f"Expected 1-sentence overlap: last of chunk {k} was '{last_s_curr}', "
+            f"first of chunk {k+1} was '{first_s_next}'"
+        )
+
+    # 3. Verify table child is standalone and embeds caption + markdown
+    tbl_children = [c for c in children if c["is_table"]]
+    assert len(tbl_children) == 1
+    assert tbl_children[0]["parent_id"] == "paper_overlap_tbl_0"
+    assert tbl_children[0]["child_id"] == "paper_overlap_tbl_0_c0"
+    assert "Table 1: Benchmark Comparisons" in tbl_children[0]["text"]
+    assert "| System | Accuracy |" in tbl_children[0]["text"]
+    assert tbl_children[0]["text"] == parents[1]["text"]
+    assert tbl_children[0]["text"] in parents[1]["text"]
+
+
+def test_overlong_sentence_split_word_boundaries():
+    """Verify an over-long sentence is split strictly at word boundaries without breaking words."""
+    long_sentence = " ".join([f"word{i:03d}" for i in range(300)])
+    parent = {
+        "parent_id": "p_long_sec_0",
+        "paper_id": "p_long",
+        "title": "Long Sentence Paper",
+        "year": 2024,
+        "section": "Long Section",
+        "section_type": "body",
+        "page_start": 1,
+        "page_end": 1,
+        "text": long_sentence,
+        "is_table": False,
+    }
+
+    children = chunk_parent_into_children(
+        parent=parent,
+        child_chunk_size=100,
+        tokenizer=None,
+    )
+    assert len(children) >= 3
+
+    p_text = parent["text"]
+    for c in children:
+        c_text = c["text"]
+        assert c_text in p_text
+        words = c_text.split()
+        for w in words:
+            assert w.startswith("word") and len(w) == 7
+
+        idx = p_text.find(c_text)
+        if idx > 0:
+            assert p_text[idx - 1] == " "
+        end_idx = idx + len(c_text)
+        if end_idx < len(p_text):
+            assert p_text[end_idx] == " "

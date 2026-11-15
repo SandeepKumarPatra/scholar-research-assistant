@@ -43,6 +43,14 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
             "top_k": 5,
             "collection_naive": "scholar_papers",
             "collection_v2": "scholar_papers_v2",
+            "collection_v3": "scholar_papers_v3",
+            "use_bm25": True,
+            "use_reranker": True,
+            "rrf_k": 60,
+            "dense_candidates": 50,
+            "bm25_candidates": 50,
+            "rerank_top_n": 20,
+            "max_parents_per_paper": None,
         },
         "chunking": {
             "child_chunk_size": DEFAULT_CHILD_CHUNK_SIZE,
@@ -57,9 +65,12 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
             "parents_db": "data/parents.db",
             "metadata_file": "data/metadata.json",
             "pdfs_dir": "data/pdfs",
+            "bm25_index": "data/bm25_index.pkl",
+            "rerank_cache": ".cache/rerank_cache.json",
         },
         "models": {
             "embedding": "BAAI/bge-m3",
+            "reranker": "BAAI/bge-reranker-v2-m3",
         },
     }
 
@@ -352,13 +363,170 @@ def split_section_if_too_large(
     return parents
 
 
+def count_tokens(text: str, tokenizer: Optional[Any] = None) -> int:
+    """Return token count of text using tokenizer if available, else regex estimation."""
+    if not text or not text.strip():
+        return 0
+    if tokenizer is not None:
+        try:
+            return len(tokenizer.encode(text, add_special_tokens=False))
+        except Exception:
+            pass
+    return estimate_tokens(text)
+
+
+ABBREVIATIONS = {
+    "e.g.", "i.e.", "et al.", "al.", "fig.", "figs.", "tab.", "tabs.",
+    "eq.", "eqs.", "ref.", "refs.", "sec.", "secs.", "vol.", "vols.",
+    "no.", "nos.", "pp.", "p.", "vs.", "approx.", "dept.", "univ.",
+    "dr.", "prof.", "mr.", "mrs.", "ms.", "cf.", "ed.", "eds.",
+}
+
+
+def split_into_sentence_spans(text: str) -> List[Tuple[int, int]]:
+    """Split text into sentence spans (start_idx, end_idx) in text.
+    
+    Handles paragraph breaks, punctuation with academic abbreviations,
+    decimals, and citation brackets. Each span (start, end) corresponds
+    to non-whitespace text.
+    """
+    clean_text = text.strip()
+    if not clean_text:
+        return []
+
+    candidate_splits: List[int] = []
+
+    # 1. Paragraph boundaries (\n\s*\n+)
+    for m in re.finditer(r"\n\s*\n+", text):
+        candidate_splits.append(m.end())
+
+    # 2. Sentence boundary punctuation [.!?]
+    for m in re.finditer(r"([.!?])(['\")\]]*)(?=\s+|$)", text):
+        punct = m.group(1)
+        punct_pos = m.start(1)
+        end_pos = m.end()
+
+        if punct == ".":
+            # Check for ellipsis (preceded or followed by another dot)
+            if (punct_pos > 0 and text[punct_pos - 1] == ".") or (
+                punct_pos + 1 < len(text) and text[punct_pos + 1] == "."
+            ):
+                continue
+
+            # Check for decimals (e.g. 3.14)
+            if punct_pos > 0 and punct_pos + 1 < len(text):
+                if text[punct_pos - 1].isdigit() and text[punct_pos + 1].isdigit():
+                    continue
+
+            # Check preceding word for abbreviations
+            preceding_match = re.search(r"([A-Za-z]+(?:\.[A-Za-z]+)*)\.$", text[: punct_pos + 1])
+            if preceding_match:
+                word = preceding_match.group(1).lower() + "."
+                two_words_match = re.search(r"\b(et\s+al)\.$", text[: punct_pos + 1], re.IGNORECASE)
+                if word in ABBREVIATIONS or (two_words_match is not None):
+                    continue
+                # Single letter initial (e.g. "J. Smith")
+                if len(preceding_match.group(1)) == 1 and preceding_match.group(1).isupper():
+                    continue
+
+            # Check if preceded only by digits at line start or whitespace (e.g., "1. Introduction")
+            num_match = re.search(r"(?:^|\n|\s)\d+\.$", text[: punct_pos + 1])
+            if num_match:
+                continue
+
+            # Check following non-whitespace character: if lowercase, likely not a sentence boundary
+            after_text = text[end_pos:].lstrip()
+            if after_text and after_text[0].islower():
+                continue
+
+        candidate_splits.append(end_pos)
+
+    # Sort and deduplicate candidate split positions
+    split_points = sorted(set(candidate_splits))
+    if not split_points or split_points[-1] < len(text):
+        split_points.append(len(text))
+
+    spans: List[Tuple[int, int]] = []
+    curr = 0
+    for sp in split_points:
+        if sp <= curr:
+            continue
+        seg = text[curr:sp]
+        l_trim = len(seg) - len(seg.lstrip())
+        r_trim = len(seg) - len(seg.rstrip())
+        start = curr + l_trim
+        end = sp - r_trim
+        if start < end:
+            spans.append((start, end))
+        curr = sp
+
+    if not spans:
+        l_trim = len(text) - len(text.lstrip())
+        r_trim = len(text) - len(text.rstrip())
+        start = l_trim
+        end = len(text) - r_trim
+        if start < end:
+            spans.append((start, end))
+
+    return spans
+
+
+def split_overlong_sentence_at_words(
+    text: str,
+    s_start: int,
+    s_end: int,
+    child_chunk_size: int = DEFAULT_CHILD_CHUNK_SIZE,
+    tokenizer: Optional[Any] = None,
+) -> List[Tuple[int, int]]:
+    """Split an over-long sentence into sub-spans at word boundaries, each <= child_chunk_size."""
+    s_text = text[s_start:s_end]
+    word_matches = list(re.finditer(r"\S+", s_text))
+    if not word_matches:
+        return [(s_start, s_end)]
+
+    sub_spans: List[Tuple[int, int]] = []
+    w_start = 0
+    n_words = len(word_matches)
+
+    while w_start < n_words:
+        w_end = w_start
+        best_end = w_start
+        while w_end < n_words:
+            cand_start = s_start + word_matches[w_start].start()
+            cand_end = s_start + word_matches[w_end].end()
+            cand_text = text[cand_start:cand_end]
+            t_count = count_tokens(cand_text, tokenizer=tokenizer)
+            if t_count <= child_chunk_size:
+                best_end = w_end
+                w_end += 1
+            else:
+                break
+
+        # If even a single word exceeded child_chunk_size, include it
+        if best_end < w_start:
+            best_end = w_start
+
+        span_start = s_start + word_matches[w_start].start()
+        span_end = s_start + word_matches[best_end].end()
+        sub_spans.append((span_start, span_end))
+        w_start = best_end + 1
+
+    return sub_spans
+
+
 def chunk_parent_into_children(
     parent: Dict[str, Any],
     child_chunk_size: int = DEFAULT_CHILD_CHUNK_SIZE,
     child_chunk_overlap: int = DEFAULT_CHILD_CHUNK_OVERLAP,
     tokenizer: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    """Split a parent record into ~300 token child chunks."""
+    """Split a parent record into ~300 token child chunks.
+
+    1. Tables are kept as standalone children (chunk_index=0), embedding caption and markdown together.
+    2. Non-table sections pack whole sentences up to ~300 tokens with 1-sentence overlap.
+    3. Over-long sentences exceeding ~300 tokens are split strictly at word boundaries.
+    4. Every child chunk is a contiguous span of parent text and never starts or ends mid-word.
+    """
     text = parent.get("text", "").strip()
     if not text:
         return []
@@ -373,7 +541,7 @@ def chunk_parent_into_children(
     p_end = parent.get("page_end", p_start)
     is_table = parent.get("is_table", False)
 
-    # If it's a table, keep table as its own single child chunk
+    # 1. If it's a table, keep table as its own single standalone child chunk
     if is_table:
         child_id = f"{parent_id}_c0"
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, child_id))
@@ -396,9 +564,10 @@ def chunk_parent_into_children(
             }
         ]
 
-    tokens, is_hf = split_text_into_tokens_or_words(text, tokenizer=tokenizer)
-    total_tokens = len(tokens)
+    parent_text = parent["text"]
+    total_tokens = count_tokens(parent_text, tokenizer=tokenizer)
 
+    # 2. If entire section fits within child_chunk_size, return single child chunk
     if total_tokens <= child_chunk_size:
         child_id = f"{parent_id}_c0"
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, child_id))
@@ -415,22 +584,66 @@ def chunk_parent_into_children(
                 "page_start": p_start,
                 "page_end": p_end,
                 "page": p_start,
-                "text": text,
+                "text": parent_text.strip(),
                 "is_table": False,
                 "chunk_index": 0,
             }
         ]
 
-    step = max(1, child_chunk_size - child_chunk_overlap)
-    children: List[Dict[str, Any]] = []
-    chunk_idx = 0
+    # 3. Split parent text into sentence spans
+    sentence_spans = split_into_sentence_spans(parent_text)
+    if not sentence_spans:
+        sentence_spans = [(0, len(parent_text))]
 
-    for i in range(0, total_tokens, step):
-        sub_tokens = tokens[i : i + child_chunk_size]
-        sub_text = decode_tokens_or_words(sub_tokens, is_hf=is_hf, tokenizer=tokenizer)
-        if not sub_text:
+    # 4. Pack sentences with 1-sentence overlap
+    chunk_spans: List[Tuple[int, int]] = []
+    i = 0
+    n_sentences = len(sentence_spans)
+
+    while i < n_sentences:
+        s_start, s_end = sentence_spans[i]
+        s_text = parent_text[s_start:s_end]
+        s_tokens = count_tokens(s_text, tokenizer=tokenizer)
+
+        # Over-long sentence: split at word boundaries
+        if s_tokens > child_chunk_size:
+            overlong_spans = split_overlong_sentence_at_words(
+                text=parent_text,
+                s_start=s_start,
+                s_end=s_end,
+                child_chunk_size=child_chunk_size,
+                tokenizer=tokenizer,
+            )
+            chunk_spans.extend(overlong_spans)
+            i += 1
             continue
 
+        # Pack whole sentences up to child_chunk_size
+        j = i
+        while j + 1 < n_sentences:
+            cand_end = sentence_spans[j + 1][1]
+            cand_text = parent_text[s_start:cand_end]
+            if count_tokens(cand_text, tokenizer=tokenizer) <= child_chunk_size:
+                j += 1
+            else:
+                break
+
+        chunk_spans.append((s_start, sentence_spans[j][1]))
+
+        # Advance with 1-sentence overlap
+        if j == n_sentences - 1:
+            break
+        elif j > i:
+            i = j
+        else:
+            i += 1
+
+    # 5. Build child records
+    children: List[Dict[str, Any]] = []
+    for chunk_idx, (start, end) in enumerate(chunk_spans):
+        child_text = parent_text[start:end]
+        if not child_text.strip():
+            continue
         child_id = f"{parent_id}_c{chunk_idx}"
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, child_id))
         children.append(
@@ -446,14 +659,11 @@ def chunk_parent_into_children(
                 "page_start": p_start,
                 "page_end": p_end,
                 "page": p_start,
-                "text": sub_text,
+                "text": child_text,
                 "is_table": False,
                 "chunk_index": chunk_idx,
             }
         )
-        chunk_idx += 1
-        if i + child_chunk_size >= total_tokens:
-            break
 
     return children
 

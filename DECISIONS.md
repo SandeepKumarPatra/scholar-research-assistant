@@ -212,3 +212,81 @@ This document records the design and architectural choices for the **scholar** p
   - Creates a timestamped backup (`parents_<timestamp>.db.bak`) prior to execution.
   - Enforces parent ID invariance: if the set of `parent_id`s differs after the refresh, the backup is automatically restored and execution aborts.
   - Generates a before/after audit report showing appendix and reference parent counts per paper, with token percentage calculations and warnings for papers exceeding 40% non-body tokens.
+
+---
+
+## 16. Sentence-Boundary Child Chunking & Collection V3 (`scholar_papers_v3`)
+
+- **Motivation**:
+  - The previous token-slicing approach cut text at arbitrary subword or token boundaries, which frequently truncated words mid-token (e.g. `hallu` / `cination`) and modified text formatting during token detokenization/decoding.
+- **Whole-Sentence Packing with 1-Sentence Overlap**:
+  - Sentences are detected using academic boundary analysis handling abbreviations (`e.g.`, `i.e.`, `et al.`, `Fig.`, `Tab.`, `vs.`, `Dr.`, etc.), citation numbers, and decimals.
+  - Whole sentences are packed up to ~300 tokens (`child_chunk_size`).
+  - Consecutive chunks share a 1-sentence overlap (the next chunk begins at the last sentence of the preceding chunk).
+  - Child text is sliced directly by character offsets `(start, end)` from `parent["text"]`, guaranteeing that every child is an authentic, 100% contiguous substring of its parent text (`child["text"] in parent["text"] == True`).
+- **Over-Long Sentence Word-Boundary Splitting**:
+  - Any single sentence exceeding ~300 tokens is split strictly at word boundaries into contiguous slices $\le 300$ tokens, ensuring chunks never start or end mid-word.
+- **Standalone Table Children with Captions**:
+  - Tables are kept as standalone child chunks (`_c0`) with the caption and markdown table embedded together in `text`.
+- **Collection Isolation (`scholar_papers_v3`)**:
+  - The new sentence-boundary chunks are indexed into a new collection: `scholar_papers_v3` (`collection_v3` in `config.yaml`).
+  - `build_index_v2.py` accepts `--collection` (defaulting to `scholar_papers_v3`), allowing `scholar_papers_v2` to remain intact for ablation comparisons.
+- **Parent ID Invariance**:
+  - `parent_id` generation for sections and tables remains completely unchanged, preserving references across SQLite `data/parents.db` and downstream evaluations.
+
+---
+
+## 17. BM25 Lexical Indexing over Child Chunks & Hyphen-Preserving Regex (Phase 3)
+
+- **Motivation**:
+  - Dense embedding retrieval often struggles with exact keyword queries, proper nouns, model names (e.g. `gpt-3.5-turbo`, `bge-reranker-v2-m3`), and benchmark acronyms (e.g. `ChainPoll`, `MiHR`, `ERBench`).
+- **Tokenization**:
+  - Regex pattern: `re.findall(r"(?u)\b[a-z0-9]+(?:-[a-z0-9]+)*\b", text.lower())`
+  - Normalizes text to lowercase while explicitly keeping numbers and hyphenated compounds as single lexical units.
+- **Index Persistence & Verification Gate**:
+  - Built offline using `python retrieval/bm25.py --build` and saved to `data/bm25_index.pkl`.
+  - Loaded once per process (`_CACHED_BM25_INDEXES`).
+  - Strict verification at load time: verifies both child count and child IDs against the Qdrant collection (`scholar_papers_v3`). If the vector database and BM25 index drift, retrieval aborts with an unambiguous message requiring `--build`.
+
+---
+
+## 18. Reciprocal Rank Fusion (RRF) & Candidate Pool Sizing (Phase 3)
+
+- **Algorithm**:
+  - Dense candidate retrieval returns top 50 child chunks (`dense_candidates: 50`).
+  - BM25 candidate retrieval returns top 50 child chunks (`bm25_candidates: 50`).
+  - Merged using Reciprocal Rank Fusion:
+    $$\text{RRF}(d) = \sum_{m \in \{\text{dense}, \text{bm25}\}} \frac{1}{k + \text{rank}_m(d)}$$
+  - Constant $k = 60$ (`rrf_k` in `config.yaml`) balances early vs late ranks and avoids arbitrary score normalization across cosine distance and BM25 unbounded scores.
+- **Top-30 Child Candidate Selection**:
+  - Retains the top 30 unique fused child chunks after sorting by RRF score descending.
+  - Merged to parent sections by taking the highest child RRF score per parent (`merge_children_to_parents`).
+  - Query-time section filtering (`include_appendix`, `include_references`) is maintained.
+
+---
+
+## 19. Cross-Encoder Reranking at Child Chunk Level (Phase 3)
+
+- **Model Selection & Architecture**:
+  - Cross-encoder: `BAAI/bge-reranker-v2-m3` configured via `models.reranker` in `config.yaml` to allow seamless swapping with lighter models (e.g. `cross-encoder/ms-marco-MiniLM-L-6-v2`).
+  - Loaded once per process via module cache.
+- **Child-Level Scoring vs Parent-Level**:
+  - Reranking scores `(query, child_text)` rather than full parent text. Child chunks are focused semantic units (~300 tokens), preventing long parent sections from causing truncation bias or dilution in cross-attention layers.
+  - Text is truncated to $\le 512$ tokens (`max_length=512`).
+- **Disk Caching**:
+  - Scores cached to disk at `.cache/rerank_cache.json` keyed by `(query, child_id)`.
+  - Avoids recomputing cross-encoder inference across iterative queries, identical sub-questions, and ablation runs.
+- **Parent Score Merging**:
+  - Parent section score equals the maximum child cross-encoder score among its constituent retrieved children.
+
+---
+
+## 20. Multi-Paper Diversity & Retrieval Benchmark Comparison (Phase 3)
+
+- **Diversity Capping (`max_parents_per_paper`)**:
+  - Optional toggle in `config.yaml` (`max_parents_per_paper`, default `null` = off).
+  - When set to a positive integer $M$, caps the number of parent contexts admitted from any single paper, preventing long papers from crowding out relevant evidence from other publications.
+- **Multi-Mode Benchmark (`scripts/compare_modes.py`)**:
+  - Runs all 4 modes (`naive`, `parent_child`, `hybrid`, `hybrid_rerank`) over standard benchmark questions.
+  - Measures end-to-end retrieval latency in milliseconds without incurring Gemini LLM API costs or rate limit overhead.
+  - Writes structured markdown reports to `compare_modes.md` showing top 5 sources and timing comparisons across phases.

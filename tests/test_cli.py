@@ -91,6 +91,73 @@ class TestCLI(unittest.TestCase):
             kwargs = mock_ret_pc.call_args.kwargs
             self.assertTrue(kwargs.get("debug"))
 
+    @patch("sys.argv", ["cli.py", "What causes hallucination?", "--mode", "hybrid"])
+    @patch("cli.retrieve_hybrid")
+    @patch("cli.answer_question")
+    def test_cli_hybrid_run(self, mock_answer, mock_ret_hybrid):
+        mock_ret_hybrid.return_value = (
+            [
+                {
+                    "paper_id": "2411.18583v1",
+                    "title": "Understanding Hallucinations",
+                    "section": "1 Introduction",
+                    "page_start": 1,
+                    "page_end": 2,
+                    "page": 1,
+                    "text": "Hybrid parent context.",
+                    "score": 0.032,
+                }
+            ],
+            {},
+        )
+        mock_answer.return_value = (
+            "Hybrid answer [Understanding Hallucinations, Pages 1-2].",
+            ["[Understanding Hallucinations, Pages 1-2]"],
+        )
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            main()
+            output = mock_stdout.getvalue()
+
+            self.assertTrue(mock_ret_hybrid.called)
+            self.assertIn("ANSWER:", output)
+            self.assertIn("Hybrid answer", output)
+            self.assertIn("SOURCES:", output)
+
+    @patch("sys.argv", ["cli.py", "What is ChainPoll?", "--mode", "hybrid_rerank", "--debug"])
+    @patch("cli.retrieve_hybrid_rerank")
+    @patch("cli.answer_question")
+    def test_cli_hybrid_rerank_debug_run(self, mock_answer, mock_ret_rerank):
+        mock_ret_rerank.return_value = (
+            [
+                {
+                    "paper_id": "2411.18583v1",
+                    "title": "ChainPoll",
+                    "section": "1 Introduction",
+                    "page_start": 1,
+                    "page_end": 1,
+                    "page": 1,
+                    "text": "Reranked parent context.",
+                    "score": 0.95,
+                }
+            ],
+            {},
+        )
+        mock_answer.return_value = (
+            "ChainPoll detects hallucinations [ChainPoll, Page 1].",
+            ["[ChainPoll, Page 1]"],
+        )
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            main()
+            output = mock_stdout.getvalue()
+
+            self.assertTrue(mock_ret_rerank.called)
+            kwargs = mock_ret_rerank.call_args.kwargs
+            self.assertTrue(kwargs.get("debug"))
+            self.assertIn("ANSWER:", output)
+            self.assertIn("ChainPoll detects hallucinations", output)
+
     @patch("sys.argv", ["cli.py", "Unindexed question", "--mode", "naive"])
     @patch("cli.retrieve")
     def test_cli_no_contexts(self, mock_retrieve):

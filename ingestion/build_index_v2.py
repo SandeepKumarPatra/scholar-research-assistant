@@ -29,6 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger("scholar.build_index_v2")
 
 DEFAULT_COLLECTION_NAME_V2 = "scholar_papers_v2"
+DEFAULT_COLLECTION_NAME_V3 = "scholar_papers_v3"
 DEFAULT_QDRANT_PATH = "./qdrant_data"
 DEFAULT_MODEL_NAME = "BAAI/bge-m3"
 EMBEDDING_DIM = 1024
@@ -56,7 +57,7 @@ def build_index_v2(
     parsed_dir: Path = DEFAULT_PARSED_DIR,
     parents_db: Path = DEFAULT_PARENTS_DB,
     qdrant_path: str = DEFAULT_QDRANT_PATH,
-    collection_name: str = DEFAULT_COLLECTION_NAME_V2,
+    collection_name: str = DEFAULT_COLLECTION_NAME_V3,
     model_name: str = DEFAULT_MODEL_NAME,
     limit: Optional[int] = None,
     recreate_index: bool = False,
@@ -212,10 +213,12 @@ def parse_args() -> argparse.Namespace:
         help="Local file path for Qdrant storage (default: ./qdrant_data).",
     )
     parser.add_argument(
+        "--collection",
         "--collection-name",
+        dest="collection_name",
         type=str,
-        default=DEFAULT_COLLECTION_NAME_V2,
-        help="Qdrant collection name (default: scholar_papers_v2).",
+        default=DEFAULT_COLLECTION_NAME_V3,
+        help="Qdrant collection name (default: scholar_papers_v3).",
     )
     parser.add_argument(
         "--model-name",

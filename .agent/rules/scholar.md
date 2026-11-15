@@ -34,3 +34,10 @@
 - Show a plan first and wait for approval before building
 - Do not run long jobs (parsing, indexing) automatically; tell me the command
   and let me run it
+
+- Hybrid components (BM25, reranker) must build only on existing child
+  chunks; never re-embed or modify existing collections
+- BM25 index and the dense collection must be built from the same child set;
+  verify with a count check at load time
+- Comparison and evaluation scripts must not call the Gemini API unless
+  explicitly asked

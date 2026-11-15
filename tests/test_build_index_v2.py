@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from ingestion.build_index_v2 import build_index_v2
+from ingestion.build_index_v2 import build_index_v2, parse_args
 
 
 @pytest.fixture
@@ -168,3 +168,40 @@ def test_build_index_v2_empty_dir(tmp_path: Path):
         )
 
     assert num_indexed == 0
+
+
+def test_build_index_v2_collection_v3_argument(mock_parsed_data):
+    parsed_dir, parents_db = mock_parsed_data
+
+    mock_client = MagicMock()
+    mock_client.get_collections.return_value.collections = []
+
+    mock_embed = MagicMock()
+    mock_embed.encode.side_effect = lambda texts, **kwargs: np.zeros((len(texts), 1024))
+
+    with patch("ingestion.chunk_structured.get_tokenizer", return_value=None):
+        num_indexed = build_index_v2(
+            parsed_dir=parsed_dir,
+            parents_db=parents_db,
+            collection_name="scholar_papers_v3",
+            client=mock_client,
+            embed_model=mock_embed,
+            recreate_index=False,
+        )
+
+    assert num_indexed == 3
+    # Check that collection scholar_papers_v3 was created and points were upserted to it
+    mock_client.create_collection.assert_called_once()
+    create_args, create_kwargs = mock_client.create_collection.call_args
+    assert create_kwargs.get("collection_name") == "scholar_papers_v3"
+
+    upsert_args, upsert_kwargs = mock_client.upsert.call_args
+    assert upsert_kwargs.get("collection_name") == "scholar_papers_v3"
+
+
+def test_parse_args_collection_flag(monkeypatch):
+    test_args = ["prog", "--collection", "scholar_papers_v3", "--limit", "10"]
+    monkeypatch.setattr("sys.argv", test_args)
+    args = parse_args()
+    assert args.collection_name == "scholar_papers_v3"
+    assert args.limit == 10
